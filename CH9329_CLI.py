@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CH9329 keyboard/mouse control through a Linux CH340 serial adapter."""
+"""CH9329 keyboard/mouse control through a CH340 serial adapter."""
 import argparse
 import hashlib
 import json
@@ -32,20 +32,32 @@ class HID:
         frame = bytes([0x57, 0xAB, 0, command, len(payload)]) + payload
         self.serial.write(frame + bytes([sum(frame) & 255]))
         self.serial.flush()
-        head = self.serial.read(5)
-        if len(head) != 5 or head[:3] != b'\x57\xab\x00' or head[4] > 64:
-            raise RuntimeError('Invalid/missing response header: ' + head.hex(' '))
-        tail = self.serial.read(head[4] + 1)
-        if len(tail) != head[4] + 1:
-            raise RuntimeError('Incomplete response')
-        if (sum(head + tail[:-1]) & 255) != tail[-1]:
-            raise RuntimeError('Response checksum mismatch')
-        data = tail[:-1]
-        if head[3] != command | 0x80:
-            raise RuntimeError('CH9329 error response: ' + (head + tail).hex(' '))
-        if command in (2, 4, 5) and data != b'\x00':
-            raise RuntimeError('HID command failed: ' + data.hex(' '))
-        return data
+        # This adapter can interleave a valid 0x81 info frame with keyboard
+        # acknowledgements. Consume only that known frame, keeping checksum and
+        # error checks intact. Never resend input just because its ACK is late.
+        deadline = time.monotonic() + 2
+        for _ in range(8):
+            if time.monotonic() >= deadline:
+                break
+            head = self.serial.read(5)
+            if len(head) != 5 or head[:3] != b'\x57\xab\x00' or head[4] > 64:
+                raise RuntimeError('Invalid/missing response header: ' + head.hex(' '))
+            tail = self.serial.read(head[4] + 1)
+            if len(tail) != head[4] + 1:
+                raise RuntimeError('Incomplete response')
+            if (sum(head + tail[:-1]) & 255) != tail[-1]:
+                raise RuntimeError('Response checksum mismatch')
+            data = tail[:-1]
+            if head[3] == 0x81 and len(data) == 8 and command != 1:
+                if data[1] != 1:
+                    raise RuntimeError('Target USB disconnected while awaiting response')
+                continue
+            if head[3] != command | 0x80:
+                raise RuntimeError('CH9329 error response: ' + (head + tail).hex(' '))
+            if command in (2, 4, 5) and data != b'\x00':
+                raise RuntimeError('HID command failed: ' + data.hex(' '))
+            return data
+        raise RuntimeError('No matching CH9329 acknowledgement')
 
     def info(self):
         data = self.exchange(1)
